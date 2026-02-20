@@ -179,33 +179,37 @@ wss.on('connection', (ws) => {
                 
                 switch(data.type) {
                     case 'join':
-                        if (isAuthenticated) {
+                        if (isAuthenticated && currentUserId) {
                             ws.send(JSON.stringify({ 
                                 type: 'error', 
                                 message: 'Вы уже подключены к комнате' 
                             }));
                             break;
                         }
-                        const result = handleJoin(ws, data, clientIP);
-                        if (result) {
-                            currentUserId = result.userId;
-                            currentRoomId = result.roomId;
-                            isAuthenticated = true;
-                            userConnections.set(currentUserId, ws);
-                            
-                            // Сохраняем ник и аватар пользователя
-                            if (data.nickname) {
-                                userNicknames.set(currentUserId, sanitizeInput(data.nickname, MAX_NICKNAME_LENGTH));
-                            }
-                            if (data.avatar) {
-                                userAvatars.set(currentUserId, sanitizeInput(data.avatar, 500));
+                        {
+                            const result = handleJoin(ws, data, clientIP);
+                            if (result) {
+                                currentUserId = result.userId;
+                                currentRoomId = result.roomId;
+                                isAuthenticated = true;
+                                userConnections.set(currentUserId, ws);
+                                
+                                // Сохраняем ник и аватар пользователя
+                                if (data.nickname) {
+                                    userNicknames.set(currentUserId, sanitizeInput(data.nickname, MAX_NICKNAME_LENGTH));
+                                }
+                                if (data.avatar) {
+                                    userAvatars.set(currentUserId, sanitizeInput(data.avatar, 500));
+                                }
                             }
                         }
                         break;
                     case 'offer':
                     case 'answer':
-                    case 'candidate':
-                        if (!isAuthenticated || !currentUserId) {
+                    case 'candidate': {
+                        // Проверяем, что отправитель действительно зарегистрирован
+                        const senderId = data.senderId;
+                        if (!senderId || !userConnections.has(senderId)) {
                             ws.send(JSON.stringify({ 
                                 type: 'error', 
                                 message: 'Необходимо подключиться к комнате' 
@@ -222,10 +226,12 @@ wss.on('connection', (ws) => {
                                 break;
                             }
                         }
-                        forwardToPeer(data, currentUserId);
+                        forwardToPeer(data, senderId);
                         break;
-                    case 'message':
-                        if (!isAuthenticated || !currentUserId) {
+                    }
+                    case 'message': {
+                        const senderId = data.senderId;
+                        if (!senderId || !userConnections.has(senderId)) {
                             ws.send(JSON.stringify({ 
                                 type: 'error', 
                                 message: 'Необходимо подключиться к комнате' 
@@ -247,10 +253,12 @@ wss.on('connection', (ws) => {
                             }));
                             break;
                         }
-                        forwardMessage(data, currentUserId);
+                        forwardMessage(data, senderId);
                         break;
-                    case 'file':
-                        if (!isAuthenticated || !currentUserId) {
+                    }
+                    case 'file': {
+                        const senderId = data.senderId;
+                        if (!senderId || !userConnections.has(senderId)) {
                             ws.send(JSON.stringify({ 
                                 type: 'error', 
                                 message: 'Необходимо подключиться к комнате' 
@@ -259,6 +267,7 @@ wss.on('connection', (ws) => {
                         }
                         forwardFile(data);
                         break;
+                    }
                     case 'leave':
                         if (currentUserId && currentRoomId) {
                             handleLeave({ userId: currentUserId, roomId: currentRoomId });
