@@ -178,66 +178,40 @@ wss.on('connection', (ws) => {
                 console.log(`Получено сообщение от ${clientIP}:`, data.type);
                 
                 switch(data.type) {
-                    case 'join':
-                        if (isAuthenticated && currentUserId) {
-                            ws.send(JSON.stringify({ 
-                                type: 'error', 
-                                message: 'Вы уже подключены к комнате' 
-                            }));
-                            break;
-                        }
-                        {
-                            const result = handleJoin(ws, data, clientIP);
-                            if (result) {
-                                currentUserId = result.userId;
-                                currentRoomId = result.roomId;
-                                isAuthenticated = true;
-                                userConnections.set(currentUserId, ws);
-                                
-                                // Сохраняем ник и аватар пользователя
-                                if (data.nickname) {
-                                    userNicknames.set(currentUserId, sanitizeInput(data.nickname, MAX_NICKNAME_LENGTH));
-                                }
-                                if (data.avatar) {
-                                    userAvatars.set(currentUserId, sanitizeInput(data.avatar, 500));
-                                }
+                    case 'join': {
+                        // Подключение к комнате / создание комнаты
+                        const result = handleJoin(ws, data, clientIP);
+                        if (result) {
+                            currentUserId = result.userId;
+                            currentRoomId = result.roomId;
+                            isAuthenticated = true;
+                            userConnections.set(currentUserId, ws);
+                            
+                            // Сохраняем ник и аватар пользователя
+                            if (data.nickname) {
+                                userNicknames.set(currentUserId, sanitizeInput(data.nickname, MAX_NICKNAME_LENGTH));
+                            }
+                            if (data.avatar) {
+                                userAvatars.set(currentUserId, sanitizeInput(data.avatar, 500));
                             }
                         }
-                        break;
-                    case 'offer':
-                    case 'answer':
-                    case 'candidate': {
-                        // Проверяем, что отправитель действительно зарегистрирован
-                        const senderId = data.senderId;
-                        if (!senderId || !userConnections.has(senderId)) {
-                            ws.send(JSON.stringify({ 
-                                type: 'error', 
-                                message: 'Необходимо подключиться к комнате' 
-                            }));
-                            break;
-                        }
-                        // Валидация WebRTC данных
-                        if (data.type === 'offer' || data.type === 'answer') {
-                            if (!data.offer && !data.answer) {
-                                ws.send(JSON.stringify({ 
-                                    type: 'error', 
-                                    message: 'Неверные данные WebRTC' 
-                                }));
-                                break;
-                            }
-                        }
-                        forwardToPeer(data, senderId);
                         break;
                     }
-                    case 'message': {
-                        const senderId = data.senderId;
-                        if (!senderId || !userConnections.has(senderId)) {
+                    case 'offer':
+                    case 'answer':
+                    case 'candidate':
+                        // Валидация WebRTC данных (минимальная)
+                        if ((data.type === 'offer' || data.type === 'answer') && !data.offer && !data.answer) {
                             ws.send(JSON.stringify({ 
                                 type: 'error', 
-                                message: 'Необходимо подключиться к комнате' 
+                                message: 'Неверные данные WebRTC' 
                             }));
                             break;
                         }
+                        // Просто пересылаем сигнал другому пользователю
+                        forwardToPeer(data);
+                        break;
+                    case 'message':
                         // Валидация текста сообщения
                         if (!data.text || typeof data.text !== 'string') {
                             ws.send(JSON.stringify({ 
@@ -253,21 +227,12 @@ wss.on('connection', (ws) => {
                             }));
                             break;
                         }
-                        forwardMessage(data, senderId);
+                        forwardMessage(data);
                         break;
-                    }
-                    case 'file': {
-                        const senderId = data.senderId;
-                        if (!senderId || !userConnections.has(senderId)) {
-                            ws.send(JSON.stringify({ 
-                                type: 'error', 
-                                message: 'Необходимо подключиться к комнате' 
-                            }));
-                            break;
-                        }
+                    case 'file':
+                        // Пересылаем информацию о файле как есть
                         forwardFile(data);
                         break;
-                    }
                     case 'leave':
                         if (currentUserId && currentRoomId) {
                             handleLeave({ userId: currentUserId, roomId: currentRoomId });
@@ -281,14 +246,7 @@ wss.on('connection', (ws) => {
                 }
             } else {
                 // Обработка бинарных данных (чанков файла)
-                if (!isAuthenticated || !currentUserId) {
-                    ws.send(JSON.stringify({ 
-                        type: 'error', 
-                        message: 'Необходимо подключиться к комнате' 
-                    }));
-                    return;
-                }
-                handleBinaryMessage(message, ws, currentUserId);
+                handleBinaryMessage(message, ws);
             }
         } catch (error) {
             console.error('Ошибка обработки сообщения:', error);
@@ -342,7 +300,7 @@ wss.on('connection', (ws) => {
     });
 });
 
-function handleBinaryMessage(data, ws, senderId) {
+function handleBinaryMessage(data, ws) {
     try {
         // Проверка размера данных
         if (data.length > 50 * 1024 * 1024) { // 50MB максимум
@@ -379,15 +337,6 @@ function handleBinaryMessage(data, ws, senderId) {
             ws.send(JSON.stringify({ 
                 type: 'error', 
                 message: 'Ошибка парсинга метаданных' 
-            }));
-            return;
-        }
-        
-        // Валидация метаданных
-        if (!metadata.fileId || !metadata.senderId || metadata.senderId !== senderId) {
-            ws.send(JSON.stringify({ 
-                type: 'error', 
-                message: 'Неверные метаданные файла' 
             }));
             return;
         }
@@ -658,19 +607,13 @@ function handleJoin(ws, data, clientIP) {
     return { userId, roomId };
 }
 
-function forwardToPeer(data, senderId) {
+function forwardToPeer(data) {
     const { targetUserId, ...message } = data;
     
     // Валидация targetUserId
     if (!targetUserId || typeof targetUserId !== 'string') {
         return;
     }
-    
-    // Проверка, что отправитель существует
-    if (!userConnections.has(senderId)) {
-        return;
-    }
-    
     const targetWs = userConnections.get(targetUserId);
     if (targetWs && targetWs.readyState === WebSocket.OPEN) {
         try {
@@ -683,7 +626,7 @@ function forwardToPeer(data, senderId) {
     }
 }
 
-function forwardMessage(data, senderId) {
+function forwardMessage(data) {
     const { targetUserId, text, senderNickname, senderAvatar } = data;
     
     // Валидация
