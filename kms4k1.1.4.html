@@ -755,10 +755,22 @@
 <body>
     <h1>🎵 Групповой аудиочат с файлами</h1>
     
-    <!-- Форма входа -->
-    <div id="login-form">
+    <!-- Аккаунт: регистрация / вход -->
+    <div id="account-form">
+        <h3>Аккаунт</h3>
+        <input type="text" id="account-username" placeholder="Логин">
+        <input type="password" id="account-password" placeholder="Пароль">
+        <div style="display: flex; gap: 10px; margin-top: 5px;">
+            <button onclick="registerAccount()" id="register-btn">📝 Регистрация</button>
+            <button onclick="loginAccount()" id="login-btn">🔐 Вход</button>
+        </div>
+        <div id="account-status" style="margin-top: 10px; font-size: 13px; color: #b9bbbe;"></div>
+    </div>
+
+    <!-- Форма входа в комнату -->
+    <div id="login-form" class="hidden">
         <h3>Вход в комнату</h3>
-        <input type="text" id="nickname" placeholder="Ваш ник" value="Участник">
+        <input type="text" id="nickname" placeholder="Ваш ник (необязательно)" value="">
         <input type="text" id="room-id" placeholder="Название комнаты" value="room1">
         <input type="number" id="max-users" placeholder="Макс. участников" value="4" min="2" max="6">
         <button onclick="joinRoom()" id="join-btn">🔗 Подключиться</button>
@@ -770,6 +782,9 @@
             <div id="messages"></div>
             
             <div id="message-input-area">
+                <div id="target-indicator" style="width:100%; font-size:12px; color:#b9bbbe; margin-bottom:4px;">
+                    Отправка: <span id="target-label">всем в комнате</span>
+                </div>
                 <input type="text" id="message-input" placeholder="Введите сообщение...">
                 <label for="file-input" class="file-upload-label">📎 Файл</label>
                 <input type="file" id="file-input" multiple onchange="handleFileSelect(this)">
@@ -810,11 +825,7 @@
     <script src="https://cdn.jsdelivr.net/npm/pako@2.0.4/dist/pako.min.js"></script>
     <script>
         // Конфигурация
-        const SIGNAL_SERVER_URL = 'wss://ksm4kk.onrender.com';
-        const TOKEN = 'secret123';
-        const USE_ENCRYPTION = false; // Включить шифрование (требует поддержки на сервере)
-        const MAX_MESSAGE_LENGTH = 10000;
-        const MAX_NICKNAME_LENGTH = 50;
+        const SIGNAL_SERVER_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
         
         // Маркеры для разных типов сообщений
         const MARKERS = {
@@ -824,108 +835,6 @@
             FILE: '[FILE]',
             MUTE: '[MUTE]'
         };
-        
-        // Функции безопасности и валидации
-        function sanitizeInput(input, maxLength = 1000) {
-            if (typeof input !== 'string') return '';
-            const div = document.createElement('div');
-            div.textContent = input;
-            return div.textContent
-                .trim()
-                .substring(0, maxLength)
-                .replace(/[\x00-\x1F\x7F]/g, '');
-        }
-        
-        function validateRoomId(roomId) {
-            if (!roomId || typeof roomId !== 'string') return false;
-            if (roomId.length > 100) return false;
-            return /^[a-zA-Z0-9_-]+$/.test(roomId);
-        }
-        
-        function validateNickname(nickname) {
-            if (!nickname || typeof nickname !== 'string') return false;
-            const sanitized = sanitizeInput(nickname, MAX_NICKNAME_LENGTH);
-            return sanitized.trim().length > 0 && sanitized.length <= MAX_NICKNAME_LENGTH;
-        }
-        
-        // Шифрование данных (Web Crypto API)
-        let encryptionKey = null;
-        
-        async function initEncryption() {
-            if (!USE_ENCRYPTION || !window.crypto || !window.crypto.subtle) {
-                return false;
-            }
-            try {
-                // Генерируем ключ для шифрования
-                encryptionKey = await window.crypto.subtle.generateKey(
-                    {
-                        name: 'AES-GCM',
-                        length: 256,
-                    },
-                    true,
-                    ['encrypt', 'decrypt']
-                );
-                return true;
-            } catch (e) {
-                console.log('Шифрование недоступно:', e);
-                return false;
-            }
-        }
-        
-        async function encryptData(data) {
-            if (!encryptionKey || !USE_ENCRYPTION) {
-                return data;
-            }
-            try {
-                const encoder = new TextEncoder();
-                const dataBuffer = encoder.encode(JSON.stringify(data));
-                const iv = window.crypto.getRandomValues(new Uint8Array(12));
-                
-                const encrypted = await window.crypto.subtle.encrypt(
-                    {
-                        name: 'AES-GCM',
-                        iv: iv
-                    },
-                    encryptionKey,
-                    dataBuffer
-                );
-                
-                const combined = new Uint8Array(iv.length + encrypted.byteLength);
-                combined.set(iv);
-                combined.set(new Uint8Array(encrypted), iv.length);
-                
-                return btoa(String.fromCharCode.apply(null, combined));
-            } catch (e) {
-                console.log('Ошибка шифрования:', e);
-                return data;
-            }
-        }
-        
-        async function decryptData(encryptedData) {
-            if (!encryptionKey || !USE_ENCRYPTION) {
-                return encryptedData;
-            }
-            try {
-                const combined = Uint8Array.from(atob(encryptedData), c => c.charCodeAt(0));
-                const iv = combined.slice(0, 12);
-                const data = combined.slice(12);
-                
-                const decrypted = await window.crypto.subtle.decrypt(
-                    {
-                        name: 'AES-GCM',
-                        iv: iv
-                    },
-                    encryptionKey,
-                    data
-                );
-                
-                const decoder = new TextDecoder();
-                return JSON.parse(decoder.decode(decrypted));
-            } catch (e) {
-                console.log('Ошибка расшифровки:', e);
-                return encryptedData;
-            }
-        }
         
         // База аватарок
         const AVATARS = [
@@ -941,6 +850,8 @@
         // Состояние приложения
         let ws = null;
         let userId = null;
+        let username = null;
+        let authToken = null;
         let userNickname = null;
         let userAvatar = null;
         let roomId = null;
@@ -987,130 +898,125 @@
         const modalImage = document.getElementById('modal-image');
         const modalVideo = document.getElementById('modal-video');
         const modalControls = document.getElementById('modal-controls');
+        const accountStatus = document.getElementById('account-status');
+        const accountForm = document.getElementById('account-form');
+        const targetIndicator = document.getElementById('target-indicator');
+        const targetLabel = document.getElementById('target-label');
+
+        // Текущая цель отправки сообщений: null = всем, иначе userId
+        let currentTargetUserId = null;
         
         function getRandomAvatar() {
             return AVATARS[Math.floor(Math.random() * AVATARS.length)];
         }
-        
-        async function joinRoom() {
-            // Валидация входных данных
-            let nicknameInput = document.getElementById('nickname').value.trim();
-            let roomIdInput = document.getElementById('room-id').value.trim();
-            let maxUsersInput = parseInt(document.getElementById('max-users').value);
-            
-            // Валидация nickname
-            if (!validateNickname(nicknameInput)) {
-                if (nicknameInput.length > MAX_NICKNAME_LENGTH) {
-                    alert(`Никнейм слишком длинный (макс. ${MAX_NICKNAME_LENGTH} символов)`);
-                    return;
-                }
-                userNickname = 'Участник';
-            } else {
-                userNickname = sanitizeInput(nicknameInput, MAX_NICKNAME_LENGTH);
-            }
-            
-            // Валидация roomId
-            if (!roomIdInput || !validateRoomId(roomIdInput)) {
-                alert('Введите корректное название комнаты (только буквы, цифры, дефис и подчеркивание)');
+
+        // --------- Аккаунты ----------
+        async function registerAccount() {
+            const u = document.getElementById('account-username').value.trim();
+            const p = document.getElementById('account-password').value;
+
+            if (!u || !p) {
+                accountStatus.textContent = 'Введите логин и пароль';
                 return;
             }
-            roomId = sanitizeInput(roomIdInput, 100);
+
+            try {
+                const resp = await fetch('/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: u, password: p })
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    accountStatus.textContent = 'Ошибка регистрации: ' + (data.error || resp.statusText);
+                    return;
+                }
+                userId = data.userId;
+                username = data.username;
+                authToken = data.token;
+                accountStatus.textContent = `Аккаунт создан: ${username}`;
+                document.getElementById('login-form').classList.remove('hidden');
+            } catch (e) {
+                accountStatus.textContent = 'Сервер недоступен';
+            }
+        }
+
+        async function loginAccount() {
+            const u = document.getElementById('account-username').value.trim();
+            const p = document.getElementById('account-password').value;
+
+            if (!u || !p) {
+                accountStatus.textContent = 'Введите логин и пароль';
+                return;
+            }
+
+            try {
+                const resp = await fetch('/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: u, password: p })
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    accountStatus.textContent = 'Ошибка входа: ' + (data.error || resp.statusText);
+                    return;
+                }
+                userId = data.userId;
+                username = data.username;
+                authToken = data.token;
+                accountStatus.textContent = `Вход выполнен как ${username}`;
+                document.getElementById('login-form').classList.remove('hidden');
+            } catch (e) {
+                accountStatus.textContent = 'Сервер недоступен';
+            }
+        }
+        
+        function joinRoom() {
+            if (!authToken) {
+                alert('Сначала войдите в аккаунт');
+                return;
+            }
+            userNickname = document.getElementById('nickname').value.trim();
+            roomId = document.getElementById('room-id').value.trim();
+            maxUsers = parseInt(document.getElementById('max-users').value);
             
-            // Валидация maxUsers
-            if (isNaN(maxUsersInput) || maxUsersInput < 2 || maxUsersInput > 6) {
-                maxUsers = 4;
-            } else {
-                maxUsers = maxUsersInput;
+            if (!userNickname) userNickname = 'Участник';
+            if (!roomId) {
+                alert('Введите название комнаты');
+                return;
             }
             
             userAvatar = getRandomAvatar();
             
-            // Инициализация шифрования (если включено)
-            if (USE_ENCRYPTION) {
-                await initEncryption();
-            }
-            
             joinBtn.disabled = true;
             joinBtn.textContent = '⏳ Подключение...';
             
-            // Оптимизированное подключение
             connectWebSocket();
         }
         
         function connectWebSocket() {
             try {
-                // Оптимизация: используем более быстрые настройки WebSocket
                 ws = new WebSocket(SIGNAL_SERVER_URL);
                 
-                // Устанавливаем таймауты для быстрого обнаружения проблем
-                const connectTimeout = setTimeout(() => {
-                    if (ws.readyState === WebSocket.CONNECTING) {
-                        ws.close();
-                        handleConnectionError();
-                    }
-                }, 10000); // 10 секунд на подключение
-                
-                ws.onopen = async () => {
-                    clearTimeout(connectTimeout);
+                ws.onopen = () => {
                     console.log('✅ WebSocket подключен');
                     reconnectAttempts = 0;
                     
-                    // Подготовка данных для отправки
-                    const joinData = {
+                    ws.send(JSON.stringify({
                         type: 'join',
                         roomId: roomId,
-                        token: TOKEN,
                         maxUsers: maxUsers,
-                        nickname: userNickname,
-                        avatar: userAvatar
-                    };
-                    
-                    // Шифрование данных (если включено)
-                    let dataToSend = joinData;
-                    if (USE_ENCRYPTION && encryptionKey) {
-                        try {
-                            const encrypted = await encryptData(joinData);
-                            dataToSend = { type: 'encrypted', data: encrypted };
-                        } catch (e) {
-                            console.log('Ошибка шифрования, отправляем без шифрования');
-                        }
-                    }
-                    
-                    // Отправка данных немедленно для быстрого подключения
-                    ws.send(JSON.stringify(dataToSend));
+                        nickname: userNickname || username,
+                        avatar: userAvatar,
+                        authToken: authToken
+                    }));
                 };
                 
-                ws.onmessage = async (event) => {
+                ws.onmessage = (event) => {
                     try {
-                        let data = JSON.parse(event.data);
-                        
-                        // Расшифровка данных (если включено)
-                        if (USE_ENCRYPTION && data.type === 'encrypted' && data.data) {
-                            try {
-                                data = await decryptData(data.data);
-                            } catch (e) {
-                                console.log('Ошибка расшифровки:', e);
-                                return;
-                            }
-                        }
-                        
-                        // Валидация полученных данных
-                        if (!data || typeof data !== 'object') {
-                            console.log('Получены неверные данные');
-                            return;
-                        }
+                        const data = JSON.parse(event.data);
                         
                         if (data.type === 'message') {
-                            // Валидация сообщения
-                            if (!data.text || typeof data.text !== 'string') {
-                                return;
-                            }
-                            
-                            if (data.text.length > MAX_MESSAGE_LENGTH * 2) {
-                                console.log('Сообщение слишком длинное');
-                                return;
-                            }
-                            
                             if (data.text && data.text.startsWith('[')) {
                                 if (data.text.startsWith(MARKERS.IMAGE)) {
                                     handleIncomingImage(data);
@@ -1123,13 +1029,10 @@
                                 } else if (data.text.startsWith(MARKERS.MUTE)) {
                                     handleIncomingMute(data);
                                 } else {
-                                    // Санитизация перед отображением
-                                    const safeText = sanitizeInput(data.text, MAX_MESSAGE_LENGTH);
-                                    addMessage(safeText, data.senderId, data.senderNickname, data.senderAvatar);
+                                    addMessage(data.text, data.senderId, data.senderNickname, data.senderAvatar, false, data.isPrivate);
                                 }
                             } else {
-                                const safeText = sanitizeInput(data.text, MAX_MESSAGE_LENGTH);
-                                addMessage(safeText, data.senderId, data.senderNickname, data.senderAvatar);
+                                addMessage(data.text, data.senderId, data.senderNickname, data.senderAvatar, false, data.isPrivate);
                             }
                         } else {
                             handleWebSocketMessage(data);
@@ -1531,74 +1434,29 @@
         }
         
         async function sendMessage() {
-            let text = messageInput.value.trim();
+            const text = messageInput.value.trim();
             
-            // Валидация сообщения
-            if (!text) {
-                return;
-            }
-            
-            if (text.length > MAX_MESSAGE_LENGTH) {
-                alert(`Сообщение слишком длинное (макс. ${MAX_MESSAGE_LENGTH} символов)`);
-                return;
-            }
-            
-            // Санитизация текста
-            text = sanitizeInput(text, MAX_MESSAGE_LENGTH);
-            
-            if (!text || text.length === 0) {
-                return;
-            }
-            
-            try {
+            if (text) {
                 const compressedText = compressText(text);
                 const messageWithMarker = MARKERS.TEXT + compressedText;
                 
-                // Отображаем сообщение локально
-                addMessage(text, userId, userNickname, userAvatar, true);
-                
-                // Подготовка данных для отправки
-                const messageData = {
-                    type: 'message',
-                    text: messageWithMarker,
-                    senderId: userId,
-                    senderNickname: sanitizeInput(userNickname, MAX_NICKNAME_LENGTH),
-                    senderAvatar: userAvatar
-                };
-                
-                // Отправка сообщений другим пользователям
-                const otherUsers = getOtherUsers();
-                if (otherUsers.length === 0) {
-                    addSystemMessage('⚠️ В комнате пока только вы');
-                }
-                
-                for (const targetId of otherUsers) {
-                    try {
-                        let dataToSend = {
-                            ...messageData,
-                            targetUserId: targetId
-                        };
-                        
-                        // Шифрование (если включено)
-                        if (USE_ENCRYPTION && encryptionKey) {
-                            try {
-                                const encrypted = await encryptData(dataToSend);
-                                dataToSend = { type: 'encrypted', data: encrypted };
-                            } catch (e) {
-                                console.log('Ошибка шифрования сообщения');
-                            }
-                        }
-                        
-                        ws.send(JSON.stringify(dataToSend));
-                    } catch (e) {
-                        console.log(`Ошибка отправки сообщения пользователю ${targetId}:`, e);
-                    }
-                }
+                const isPrivate = !!currentTargetUserId;
+                addMessage(text, userId, userNickname, userAvatar, true, isPrivate);
+
+                const targets = currentTargetUserId ? [currentTargetUserId] : getOtherUsers();
+                targets.forEach(targetId => {
+                    ws.send(JSON.stringify({
+                        type: 'message',
+                        targetUserId: targetId,
+                        text: messageWithMarker,
+                        senderId: userId,
+                        senderNickname: userNickname,
+                        senderAvatar: userAvatar,
+                        isPrivate: isPrivate
+                    }));
+                });
                 
                 messageInput.value = '';
-            } catch (e) {
-                console.log('Ошибка отправки сообщения:', e);
-                addSystemMessage('❌ Ошибка отправки сообщения');
             }
             
             if (pendingFiles.length > 0) {
@@ -1880,17 +1738,18 @@
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
         
-        function addMessage(text, senderId, senderNickname, senderAvatar, isOwn = false) {
+        function addMessage(text, senderId, senderNickname, senderAvatar, isOwn = false, isPrivate = false) {
             const messageDiv = document.createElement('div');
             messageDiv.className = 'message' + (isOwn ? ' own' : '');
             
             const avatar = senderAvatar || (isOwn ? userAvatar : getUserAvatar(senderId));
             const sender = isOwn ? 'Вы' : (senderNickname || senderId.substring(0,8) + '...');
+            const privateBadge = isPrivate ? '<span class="file-badge">Личное сообщение</span>' : '';
             
             messageDiv.innerHTML = `
                 <img class="message-avatar" src="${avatar}" alt="avatar">
                 <div class="message-content">
-                    <strong>${sender}:</strong>
+                    <strong>${sender} ${privateBadge}</strong>
                     <div class="message-text">${escapeHtml(text)}</div>
                 </div>
             `;
@@ -2048,66 +1907,52 @@
         }
         
         function escapeHtml(text) {
-            if (typeof text !== 'string') return '';
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
         }
-        
-        // Дополнительная защита от XSS для HTML контента
-        function sanitizeHtml(html) {
-            if (typeof html !== 'string') return '';
-            const div = document.createElement('div');
-            div.textContent = html;
-            return div.innerHTML;
+
+        // Выбор цели отправки сообщений: null = всем, иначе userId
+        function selectTarget(targetId) {
+            currentTargetUserId = targetId;
+            if (!targetLabel) return;
+
+            if (!targetId) {
+                targetLabel.textContent = 'всем в комнате';
+            } else {
+                const nick = usersNicknames.get(targetId) || targetId.substring(0, 8) + '...';
+                targetLabel.textContent = '@' + nick + ' (личные сообщения)';
+            }
         }
         
         function handleJoined(data) {
-            // Валидация данных подключения
-            if (!data.userId || !data.roomId) {
-                alert('Ошибка подключения: неверные данные от сервера');
-                resetUI();
-                return;
-            }
-            
             userId = data.userId;
-            users = Array.isArray(data.users) ? data.users : [];
+            users = data.users || [];
             
-            // Санитизация данных пользователей
-            usersNicknames.set(userId, sanitizeInput(userNickname, MAX_NICKNAME_LENGTH));
+            usersNicknames.set(userId, userNickname);
             usersAvatars.set(userId, userAvatar);
             
-            if (data.nicknames && typeof data.nicknames === 'object') {
+            if (data.nicknames) {
                 for (const [id, nick] of Object.entries(data.nicknames)) {
-                    if (id && nick) {
-                        usersNicknames.set(id, sanitizeInput(String(nick), MAX_NICKNAME_LENGTH));
-                    }
+                    usersNicknames.set(id, nick);
                 }
             }
-            if (data.avatars && typeof data.avatars === 'object') {
+            if (data.avatars) {
                 for (const [id, avatar] of Object.entries(data.avatars)) {
-                    if (id && avatar) {
-                        usersAvatars.set(id, sanitizeInput(String(avatar), 500));
-                    }
+                    usersAvatars.set(id, avatar);
                 }
             }
             
             loginForm.classList.add('hidden');
             mainContainer.classList.remove('hidden');
             
-            maxUsersSpan.textContent = data.maxUsers || maxUsers;
+            maxUsersSpan.textContent = maxUsers;
             updateUsersList();
             
-            // Оптимизация: если комната только что создана, уведомляем пользователя
-            if (data.isNewRoom) {
-                addSystemMessage(`✅ Комната "${roomId}" создана. Вы подключились как ${userNickname}`);
-            } else {
-                addSystemMessage(`✅ Вы подключились к комнате "${roomId}" как ${userNickname}`);
-            }
+            addSystemMessage(`✅ Вы подключились к комнате "${roomId}" как ${userNickname}`);
             
             startConnectionCheck();
-            // Проверка микрофона асинхронно, не блокируя UI
-            setTimeout(() => checkMicrophonePermission(), 100);
+            checkMicrophonePermission();
         }
         
         function checkMicrophonePermission() {
@@ -2130,26 +1975,7 @@
                 if (data.avatar) usersAvatars.set(data.userId, data.avatar);
                 
                 // Добавляем нового пользователя в список без перерисовки всего
-                const otherUsers = getOtherUsers();
-                const newUserHtml = `
-                    <div class="user-item" data-user-id="${data.userId}">
-                        <img class="user-avatar" src="${data.avatar || AVATARS[0]}" alt="avatar">
-                        <div class="user-info">
-                            <span class="user-name">${data.nickname || data.userId.substring(0,8)}</span>
-                            <span class="user-status-text">📱 Онлайн</span>
-                        </div>
-                        <div class="user-actions">
-                            <button class="mute-btn" onclick="toggleUserMute('${data.userId}')" title="Заглушить">
-                                🎤
-                            </button>
-                        </div>
-                        <span class="user-status online"></span>
-                    </div>
-                `;
-                
-                usersDiv.insertAdjacentHTML('beforeend', newUserHtml);
-                userCountSpan.textContent = users.length;
-                
+                updateUsersList();
                 addSystemMessage(`👤 Пользователь ${data.nickname || data.userId.substring(0,8)}... подключился`);
                 
                 if (callActive && localStream) {
@@ -2185,6 +2011,14 @@
             closePeerConnection(data.userId);
             
             if (callActive && getOtherUsers().length === 0) endCall();
+
+            // Если мы писали ему личные сообщения, сбрасываем цель на "всем"
+            if (currentTargetUserId === data.userId) {
+                currentTargetUserId = null;
+                if (targetLabel) {
+                    targetLabel.textContent = 'всем в комнате';
+                }
+            }
         }
         
         function closePeerConnection(targetUserId) {
@@ -2223,7 +2057,7 @@
             
             usersDiv.innerHTML = [
                 // Текущий пользователь
-                `<div class="user-item current ${speakingUsers.has(userId) ? 'speaking' : ''}" data-user-id="${userId}">
+                `<div class="user-item current ${speakingUsers.has(userId) ? 'speaking' : ''}" data-user-id="${userId}" onclick="selectTarget(null)">
                     <img class="user-avatar" src="${userAvatar}" alt="avatar">
                     <div class="user-info">
                         <span class="user-name">${userNickname} (вы)</span>
@@ -2245,7 +2079,7 @@
                     const nick = usersNicknames.get(id) || id.substring(0,8) + '...';
                     const avatar = usersAvatars.get(id) || AVATARS[0];
                     
-                    return `<div class="user-item ${isSpeaking ? 'speaking' : ''}" data-user-id="${id}">
+                    return `<div class="user-item ${isSpeaking ? 'speaking' : ''}" data-user-id="${id}" onclick="selectTarget('${id}')">
                         <img class="user-avatar" src="${avatar}" alt="avatar">
                         <div class="user-info">
                             <span class="user-name">${nick}</span>

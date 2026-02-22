@@ -12,237 +12,124 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, maxPayload: 50 * 1024 * 1024 }); // 50MB лимит
 
-// Конфигурация безопасности
-const SECRET_KEY = process.env.SECRET_KEY || crypto.randomBytes(32).toString('hex');
-const TOKEN_SECRET = process.env.TOKEN_SECRET || crypto.randomBytes(16).toString('hex');
-const MAX_MESSAGE_LENGTH = 10000;
-const MAX_NICKNAME_LENGTH = 50;
-const MAX_ROOM_ID_LENGTH = 100;
-const RATE_LIMIT_WINDOW = 60000; // 1 минута
-const RATE_LIMIT_MAX_MESSAGES = 30;
-
 // Хранилище комнат
 const rooms = new Map();
 
 // Хранение WebSocket соединений по userId
 const userConnections = new Map();
 
+// Хранение пользователей и сессий (упрощённые аккаунты в памяти)
+// userId -> { id, username, passwordHash }
+const users = new Map();
+// username -> userId
+const usernameIndex = new Map();
+// authToken -> userId
+const authTokens = new Map();
+
 // Хранение ников и аватаров пользователей
 const userNicknames = new Map();
 const userAvatars = new Map();
 
-// Rate limiting по IP
-const rateLimitMap = new Map();
+function hashPassword(password) {
+    return crypto.createHash('sha256').update(password).digest('hex');
+}
 
-// Очистка старых файловых чанков
-const fileChunks = new Map();
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, chunk] of fileChunks.entries()) {
-        if (chunk.timestamp && now - chunk.timestamp > 300000) { // 5 минут
-            fileChunks.delete(key);
-        }
+function generateToken() {
+    return crypto.randomBytes(24).toString('hex');
+}
+
+// Простая регистрация
+app.post('/register', (req, res) => {
+    const { username, password } = req.body || {};
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Укажите логин и пароль' });
     }
-}, 60000);
 
-// Функции безопасности
-function sanitizeInput(input, maxLength = 1000) {
-    if (typeof input !== 'string') return '';
-    return input
-        .trim()
-        .substring(0, maxLength)
-        .replace(/[<>]/g, '') // Базовая защита от XSS
-        .replace(/[\x00-\x1F\x7F]/g, ''); // Удаляем управляющие символы
-}
-
-function validateRoomId(roomId) {
-    if (!roomId || typeof roomId !== 'string') return false;
-    if (roomId.length > MAX_ROOM_ID_LENGTH) return false;
-    return /^[a-zA-Z0-9_-]+$/.test(roomId); // Только буквы, цифры, дефис и подчеркивание
-}
-
-function validateNickname(nickname) {
-    if (!nickname || typeof nickname !== 'string') return false;
-    if (nickname.length > MAX_NICKNAME_LENGTH) return false;
-    return nickname.trim().length > 0;
-}
-
-function validateAvatar(avatar) {
-    if (!avatar) return true; // Аватар опционален
-    if (typeof avatar !== 'string') return false;
-    if (avatar.length > 500) return false;
-    return /^https?:\/\/.+/.test(avatar); // Должен быть валидный URL
-}
-
-function checkRateLimit(ip) {
-    const now = Date.now();
-    const userLimit = rateLimitMap.get(ip) || { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
-    
-    if (now > userLimit.resetTime) {
-        userLimit.count = 0;
-        userLimit.resetTime = now + RATE_LIMIT_WINDOW;
+    if (usernameIndex.has(username)) {
+        return res.status(409).json({ error: 'Такой логин уже занят' });
     }
-    
-    userLimit.count++;
-    rateLimitMap.set(ip, userLimit);
-    
-    if (userLimit.count > RATE_LIMIT_MAX_MESSAGES) {
-        return false;
+
+    const userId = generateUserId();
+    const passwordHash = hashPassword(password);
+
+    const user = { id: userId, username, passwordHash };
+    users.set(userId, user);
+    usernameIndex.set(username, userId);
+
+    const token = generateToken();
+    authTokens.set(token, userId);
+
+    return res.json({ userId, username, token });
+});
+
+// Простой логин
+app.post('/login', (req, res) => {
+    const { username, password } = req.body || {};
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Укажите логин и пароль' });
     }
-    return true;
-}
 
-function getClientIP(ws) {
-    return ws._socket?.remoteAddress || 'unknown';
-}
-
-// Шифрование данных (опционально, для чувствительных данных)
-function encryptData(data, key = SECRET_KEY) {
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(key.substring(0, 32), 'hex'), iv);
-    let encrypted = cipher.update(JSON.stringify(data), 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    return iv.toString('hex') + ':' + encrypted;
-}
-
-function decryptData(encryptedData, key = SECRET_KEY) {
-    try {
-        const parts = encryptedData.split(':');
-        const iv = Buffer.from(parts[0], 'hex');
-        const encrypted = parts[1];
-        const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(key.substring(0, 32), 'hex'), iv);
-        let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-        decrypted += decipher.final('utf8');
-        return JSON.parse(decrypted);
-    } catch (e) {
-        return null;
+    const userId = usernameIndex.get(username);
+    if (!userId) {
+        return res.status(401).json({ error: 'Неверный логин или пароль' });
     }
-}
+
+    const user = users.get(userId);
+    if (!user || user.passwordHash !== hashPassword(password)) {
+        return res.status(401).json({ error: 'Неверный логин или пароль' });
+    }
+
+    const token = generateToken();
+    authTokens.set(token, userId);
+
+    return res.json({ userId, username, token });
+});
 
 wss.on('connection', (ws) => {
-    const clientIP = getClientIP(ws);
-    console.log(`Новое подключение с IP: ${clientIP}`);
-    
+    console.log('Новое подключение');
     let currentUserId = null;
     let currentRoomId = null;
-    let isAuthenticated = false;
-    
-    // Проверка rate limit при подключении
-    if (!checkRateLimit(clientIP)) {
-        ws.close(1008, 'Rate limit exceeded');
-        return;
-    }
     
     ws.on('message', (message) => {
         try {
-            // Проверка rate limit для каждого сообщения
-            if (!checkRateLimit(clientIP)) {
-                ws.send(JSON.stringify({ 
-                    type: 'error', 
-                    message: 'Превышен лимит сообщений. Подождите немного.' 
-                }));
-                return;
-            }
-            
             // Проверяем, является ли сообщение строкой (JSON) или бинарными данными
             if (typeof message === 'string') {
-                // Проверка размера сообщения
-                if (message.length > MAX_MESSAGE_LENGTH * 10) {
-                    ws.send(JSON.stringify({ 
-                        type: 'error', 
-                        message: 'Сообщение слишком большое' 
-                    }));
-                    return;
-                }
-                
-                let data;
-                try {
-                    data = JSON.parse(message);
-                } catch (e) {
-                    ws.send(JSON.stringify({ 
-                        type: 'error', 
-                        message: 'Неверный формат сообщения' 
-                    }));
-                    return;
-                }
-                
-                // Валидация типа сообщения
-                if (!data.type || typeof data.type !== 'string') {
-                    ws.send(JSON.stringify({ 
-                        type: 'error', 
-                        message: 'Не указан тип сообщения' 
-                    }));
-                    return;
-                }
-                
-                console.log(`Получено сообщение от ${clientIP}:`, data.type);
+                const data = JSON.parse(message);
+                console.log('Получено сообщение:', data.type);
                 
                 switch(data.type) {
-                    case 'join': {
-                        // Подключение к комнате / создание комнаты
-                        const result = handleJoin(ws, data, clientIP);
+                    case 'join':
+                        const result = handleJoin(ws, data);
                         if (result) {
                             currentUserId = result.userId;
                             currentRoomId = result.roomId;
-                            isAuthenticated = true;
                             userConnections.set(currentUserId, ws);
                             
                             // Сохраняем ник и аватар пользователя
                             if (data.nickname) {
-                                userNicknames.set(currentUserId, sanitizeInput(data.nickname, MAX_NICKNAME_LENGTH));
+                                userNicknames.set(currentUserId, data.nickname);
                             }
                             if (data.avatar) {
-                                userAvatars.set(currentUserId, sanitizeInput(data.avatar, 500));
+                                userAvatars.set(currentUserId, data.avatar);
                             }
                         }
                         break;
-                    }
                     case 'offer':
                     case 'answer':
                     case 'candidate':
-                        // Валидация WebRTC данных (минимальная)
-                        if ((data.type === 'offer' || data.type === 'answer') && !data.offer && !data.answer) {
-                            ws.send(JSON.stringify({ 
-                                type: 'error', 
-                                message: 'Неверные данные WebRTC' 
-                            }));
-                            break;
-                        }
-                        // Просто пересылаем сигнал другому пользователю
                         forwardToPeer(data);
                         break;
                     case 'message':
-                        // Валидация текста сообщения
-                        if (!data.text || typeof data.text !== 'string') {
-                            ws.send(JSON.stringify({ 
-                                type: 'error', 
-                                message: 'Текст сообщения обязателен' 
-                            }));
-                            break;
-                        }
-                        if (data.text.length > MAX_MESSAGE_LENGTH) {
-                            ws.send(JSON.stringify({ 
-                                type: 'error', 
-                                message: `Сообщение слишком длинное (макс. ${MAX_MESSAGE_LENGTH} символов)` 
-                            }));
-                            break;
-                        }
                         forwardMessage(data);
                         break;
                     case 'file':
-                        // Пересылаем информацию о файле как есть
                         forwardFile(data);
                         break;
                     case 'leave':
-                        if (currentUserId && currentRoomId) {
-                            handleLeave({ userId: currentUserId, roomId: currentRoomId });
-                        }
+                        handleLeave(data);
                         break;
-                    default:
-                        ws.send(JSON.stringify({ 
-                            type: 'error', 
-                            message: 'Неизвестный тип сообщения' 
-                        }));
                 }
             } else {
                 // Обработка бинарных данных (чанков файла)
@@ -250,23 +137,11 @@ wss.on('connection', (ws) => {
             }
         } catch (error) {
             console.error('Ошибка обработки сообщения:', error);
-            try {
-                ws.send(JSON.stringify({ 
-                    type: 'error', 
-                    message: 'Ошибка обработки запроса' 
-                }));
-            } catch (e) {
-                // Соединение уже закрыто
-            }
         }
     });
     
-    ws.on('error', (error) => {
-        console.error('WebSocket ошибка:', error);
-    });
-    
     ws.on('close', () => {
-        console.log(`Клиент отключился: ${clientIP}`);
+        console.log('Клиент отключился');
         
         // Очистка при отключении
         if (currentUserId && currentRoomId) {
@@ -275,19 +150,12 @@ wss.on('connection', (ws) => {
             userNicknames.delete(currentUserId);
             userAvatars.delete(currentUserId);
         }
-        
-        // Очистка rate limit через время
-        setTimeout(() => {
-            rateLimitMap.delete(clientIP);
-        }, RATE_LIMIT_WINDOW);
     });
     
     // Отправляем ping для проверки соединения
     const pingInterval = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
             ws.ping();
-        } else {
-            clearInterval(pingInterval);
         }
     }, 30000);
     
@@ -300,58 +168,26 @@ wss.on('connection', (ws) => {
     });
 });
 
+// Хранилище для собираемых файловых чанков
+const fileChunks = new Map();
+
 function handleBinaryMessage(data, ws) {
     try {
-        // Проверка размера данных
-        if (data.length > 50 * 1024 * 1024) { // 50MB максимум
-            ws.send(JSON.stringify({ 
-                type: 'error', 
-                message: 'Файл слишком большой' 
-            }));
-            return;
-        }
-        
         // Первые 4 байта - длина metadata
-        if (data.length < 4) {
-            ws.send(JSON.stringify({ 
-                type: 'error', 
-                message: 'Неверный формат бинарных данных' 
-            }));
-            return;
-        }
-        
         const metadataLength = data.readUInt32BE(0);
-        if (metadataLength > 10000 || data.length < 4 + metadataLength) {
-            ws.send(JSON.stringify({ 
-                type: 'error', 
-                message: 'Неверный формат метаданных' 
-            }));
-            return;
-        }
-        
         const metadataString = data.toString('utf8', 4, 4 + metadataLength);
-        let metadata;
-        try {
-            metadata = JSON.parse(metadataString);
-        } catch (e) {
-            ws.send(JSON.stringify({ 
-                type: 'error', 
-                message: 'Ошибка парсинга метаданных' 
-            }));
-            return;
-        }
+        const metadata = JSON.parse(metadataString);
         
         // Остальное - данные файла
         const fileData = data.slice(4 + metadataLength);
         
         switch(metadata.type) {
             case 'file_chunk':
-                // Сохраняем чанк с временной меткой
+                // Сохраняем чанк
                 const key = `${metadata.fileId}_${metadata.chunkIndex}`;
                 fileChunks.set(key, {
                     data: fileData,
-                    metadata: metadata,
-                    timestamp: Date.now()
+                    metadata: metadata
                 });
                 
                 // Проверяем, собраны ли все чанки
@@ -365,14 +201,6 @@ function handleBinaryMessage(data, ws) {
         }
     } catch (error) {
         console.error('Ошибка обработки бинарного сообщения:', error);
-        try {
-            ws.send(JSON.stringify({ 
-                type: 'error', 
-                message: 'Ошибка обработки файла' 
-            }));
-        } catch (e) {
-            // Соединение закрыто
-        }
     }
 }
 
@@ -483,12 +311,30 @@ function sendBinaryFile(ws, data) {
     ws.send(message, { binary: true });
 }
 
-function handleJoin(ws, data, clientIP) {
-    // Валидация входных данных
-    let { roomId, maxUsers, nickname, avatar } = data;
+function handleJoin(ws, data) {
+    const { roomId, maxUsers, nickname, avatar, authToken } = data;
     
-    // Валидация roomId
-    if (!roomId || typeof roomId !== 'string') {
+    // Проверяем токен авторизации
+    if (!authToken || !authTokens.has(authToken)) {
+        ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Не авторизовано. Сначала войдите в аккаунт.'
+        }));
+        return null;
+    }
+
+    const userId = authTokens.get(authToken);
+    const user = users.get(userId);
+    if (!user) {
+        ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Пользователь не найден. Перезайдите в аккаунт.'
+        }));
+        return null;
+    }
+
+    // Проверяем наличие комнаты
+    if (!roomId) {
         ws.send(JSON.stringify({ 
             type: 'error', 
             message: 'Укажите название комнаты' 
@@ -496,48 +342,19 @@ function handleJoin(ws, data, clientIP) {
         return null;
     }
     
-    roomId = sanitizeInput(roomId, MAX_ROOM_ID_LENGTH);
-    if (!validateRoomId(roomId)) {
-        ws.send(JSON.stringify({ 
-            type: 'error', 
-            message: 'Название комнаты может содержать только буквы, цифры, дефис и подчеркивание' 
-        }));
-        return null;
-    }
-    
-    // Валидация maxUsers
-    maxUsers = parseInt(maxUsers) || 4;
-    if (isNaN(maxUsers) || maxUsers < 2 || maxUsers > 6) {
-        maxUsers = 4; // Значение по умолчанию
-    }
-    
-    // Валидация nickname
-    nickname = nickname ? sanitizeInput(nickname, MAX_NICKNAME_LENGTH) : 'Участник';
-    if (!validateNickname(nickname)) {
-        nickname = 'Участник';
-    }
-    
-    // Валидация avatar
-    avatar = avatar ? sanitizeInput(avatar, 500) : null;
-    if (avatar && !validateAvatar(avatar)) {
-        avatar = null;
-    }
-    
     let room = rooms.get(roomId);
-    const isNewRoom = !room;
     
-    // Если комната не существует, создаем (оптимизированное создание)
+    // Если комната не существует, создаем
     if (!room) {
         room = {
             id: roomId,
-            maxUsers: maxUsers,
+            maxUsers: Math.min(maxUsers || 6, 6), // Максимум 6
             users: [],
-            userData: new Map(),
-            creationTime: Date.now(),
-            ready: true // Флаг готовности комнаты
+            userData: new Map(), // Храним ники и аватары пользователей в комнате
+            creationTime: Date.now()
         };
         rooms.set(roomId, room);
-        console.log(`✅ Создана комната ${roomId} на ${room.maxUsers} человек (IP: ${clientIP})`);
+        console.log(`Создана комната ${roomId} на ${room.maxUsers} человек`);
     }
     
     // Проверяем количество пользователей
@@ -549,15 +366,23 @@ function handleJoin(ws, data, clientIP) {
         return null;
     }
     
-    // Создаем пользователя
-    const userId = generateUserId();
+    // Проверяем, не находится ли пользователь уже в комнате
+    const alreadyInRoom = room.users.find(u => u.id === userId);
+    if (alreadyInRoom) {
+        ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Вы уже находитесь в этой комнате'
+        }));
+        return null;
+    }
+
+    // Создаем пользователя в рамках комнаты
     const user = {
         id: userId,
         ws: ws,
-        nickname: nickname,
-        avatar: avatar,
-        joinTime: Date.now(),
-        ip: clientIP
+        nickname: nickname || user.username || 'Участник',
+        avatar: avatar || null,
+        joinTime: Date.now()
     };
     
     room.users.push(user);
@@ -568,41 +393,35 @@ function handleJoin(ws, data, clientIP) {
         avatar: user.avatar
     });
     
-    console.log(`👤 Пользователь ${userId} (${user.nickname}) присоединился к комнате ${roomId}. Всего: ${room.users.length}/${room.maxUsers}`);
+    console.log(`Пользователь ${userId} (${user.nickname}) присоединился к комнате ${roomId}. Всего: ${room.users.length}/${room.maxUsers}`);
     
-    // Собираем ники и аватары всех пользователей в комнате (оптимизировано)
+    // Собираем ники и аватары всех пользователей в комнате
     const nicknames = {};
     const avatars = {};
-    for (const u of room.users) {
+    room.users.forEach(u => {
         nicknames[u.id] = u.nickname;
         avatars[u.id] = u.avatar;
-    }
+    });
     
-    // Отправляем подтверждение новому пользователю (оптимизированная отправка)
-    const joinResponse = {
+    // Отправляем подтверждение новому пользователю
+    ws.send(JSON.stringify({
         type: 'joined',
         userId: userId,
         users: room.users.map(u => u.id),
         roomId: roomId,
         maxUsers: room.maxUsers,
         nicknames: nicknames,
-        avatars: avatars,
-        isNewRoom: isNewRoom // Информируем клиента, что комната только что создана
-    };
+        avatars: avatars
+    }));
     
-    // Отправляем ответ немедленно для быстрого подключения
-    ws.send(JSON.stringify(joinResponse));
-    
-    // Уведомляем других о новом пользователе (асинхронно, не блокируя ответ)
-    setImmediate(() => {
-        broadcastToRoom(roomId, {
-            type: 'user_joined',
-            userId: userId,
-            users: room.users.map(u => u.id),
-            nickname: user.nickname,
-            avatar: user.avatar
-        }, ws);
-    });
+    // Уведомляем других о новом пользователе с его ником и аватаром
+    broadcastToRoom(roomId, {
+        type: 'user_joined',
+        userId: userId,
+        users: room.users.map(u => u.id),
+        nickname: user.nickname,
+        avatar: user.avatar
+    }, ws);
     
     return { userId, roomId };
 }
@@ -610,52 +429,27 @@ function handleJoin(ws, data, clientIP) {
 function forwardToPeer(data) {
     const { targetUserId, ...message } = data;
     
-    // Валидация targetUserId
-    if (!targetUserId || typeof targetUserId !== 'string') {
-        return;
-    }
     const targetWs = userConnections.get(targetUserId);
     if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        try {
-            targetWs.send(JSON.stringify(message));
-        } catch (error) {
-            console.error(`Ошибка отправки сообщения пользователю ${targetUserId}:`, error);
-        }
+        targetWs.send(JSON.stringify(message));
     } else {
         console.log(`Пользователь ${targetUserId} не найден или не в сети`);
     }
 }
 
 function forwardMessage(data) {
-    const { targetUserId, text, senderNickname, senderAvatar } = data;
-    
-    // Валидация
-    if (!targetUserId || typeof targetUserId !== 'string') {
-        return;
-    }
-    
-    if (!text || typeof text !== 'string' || text.length > MAX_MESSAGE_LENGTH) {
-        return;
-    }
-    
-    // Санитизация данных перед отправкой
-    const sanitizedNickname = senderNickname ? sanitizeInput(senderNickname, MAX_NICKNAME_LENGTH) : 'Пользователь';
-    const sanitizedAvatar = senderAvatar ? sanitizeInput(senderAvatar, 500) : null;
-    const sanitizedText = sanitizeInput(text, MAX_MESSAGE_LENGTH);
+    const { targetUserId, text, senderId, senderNickname, senderAvatar, isPrivate } = data;
     
     const targetWs = userConnections.get(targetUserId);
     if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        try {
-            targetWs.send(JSON.stringify({
-                type: 'message',
-                text: sanitizedText,
-                senderId: senderId,
-                senderNickname: sanitizedNickname,
-                senderAvatar: sanitizedAvatar
-            }));
-        } catch (error) {
-            console.error(`Ошибка отправки сообщения пользователю ${targetUserId}:`, error);
-        }
+        targetWs.send(JSON.stringify({
+            type: 'message',
+            text: text,
+            senderId: senderId,
+            senderNickname: senderNickname,
+            senderAvatar: senderAvatar,
+            isPrivate: !!isPrivate
+        }));
     }
 }
 
@@ -717,35 +511,12 @@ function handleUserDisconnect(userId, roomId) {
 function broadcastToRoom(roomId, message, excludeWs = null) {
     const room = rooms.get(roomId);
     if (room) {
-        try {
-            const messageStr = JSON.stringify(message);
-            const failedUsers = [];
-            
-            room.users.forEach(user => {
-                if (user.ws !== excludeWs && user.ws.readyState === WebSocket.OPEN) {
-                    try {
-                        user.ws.send(messageStr);
-                    } catch (error) {
-                        console.error(`Ошибка отправки broadcast пользователю ${user.id}:`, error);
-                        failedUsers.push(user.id);
-                    }
-                }
-            });
-            
-            // Удаляем пользователей с неработающими соединениями
-            if (failedUsers.length > 0) {
-                failedUsers.forEach(userId => {
-                    const userIndex = room.users.findIndex(u => u.id === userId);
-                    if (userIndex !== -1) {
-                        room.users.splice(userIndex, 1);
-                        room.userData.delete(userId);
-                        userConnections.delete(userId);
-                    }
-                });
+        const messageStr = JSON.stringify(message);
+        room.users.forEach(user => {
+            if (user.ws !== excludeWs && user.ws.readyState === WebSocket.OPEN) {
+                user.ws.send(messageStr);
             }
-        } catch (error) {
-            console.error('Ошибка broadcast:', error);
-        }
+        });
     }
 }
 
